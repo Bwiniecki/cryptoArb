@@ -1,9 +1,9 @@
 // ===================================================================================
 //  PROGRAM: janus_arbitrage_bot (main.rs)
-//  VERSION: 9.1 (MEXC Zero-Fee Implementation - Real Trading Fixed)
-//  DATE:    2025-06-30
+//  VERSION: 9.2 (MEXC Zero-Fee Implementation - Auto-Rebalancing Enhanced)
+//  DATE:    2025-07-03
 //  PURPOSE: CEX-DEX arbitrage bot with MEXC zero-fee trading and Jupiter API
-//  IMPROVEMENT: 5x better profitability - only 0.05% spread needed vs 0.25%
+//  IMPROVEMENT: Auto-rebalancing at startup and shutdown
 // ===================================================================================
 
 use std::sync::{Arc, Mutex};
@@ -14,12 +14,15 @@ use tokio::io::AsyncBufReadExt;
 use anyhow::Result;
 use rust_decimal::Decimal;  
 use rust_decimal::prelude::*;
-use rust_decimal_macros::dec;  // ✅ FIX: Add missing import
+use rust_decimal_macros::dec; 
+use solana_sdk::signature::Signature;
+use crate::solana_trading::SolanaTradingClient;
+
 
 // Import modules defined below in this file
 use crate::state::SharedState;
 
-// 🚀 UPDATED main() function with automatic balance fetching
+// 🚀 UPDATED main() function with startup and shutdown rebalancing
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -61,6 +64,27 @@ async fn main() -> Result<()> {
         live_balances.mexc_usdc, live_balances.mexc_sol,      
         live_balances.wallet_usdc, live_balances.wallet_sol
     );
+
+    // 🆕 NEW: Startup rebalancing
+    log::info!("[MAIN] ⚖️ Step 2: Performing startup rebalancing...");
+    if let Err(e) = perform_startup_rebalancing(&live_balances, current_sol_price).await {
+        log::warn!("[MAIN] ⚠️ Startup rebalancing failed: {}", e);
+        log::warn!("[MAIN] Continuing with existing balances...");
+    } else {
+        log::info!("[MAIN] ✅ Startup rebalancing completed!");
+        
+        // Fetch updated balances after rebalancing
+        if let Ok(updated_balances) = balance_fetcher::BalanceFetcher::fetch_all_balances().await {
+            log::info!("[MAIN] 📊 Updated balances after startup rebalancing:");
+            log::info!("[MAIN] 💰 MEXC: ${:.4} USDC + {:.6} SOL", updated_balances.mexc_usdc, updated_balances.mexc_sol);
+            log::info!("[MAIN] 🏦 Wallet: ${:.4} USDC + {:.6} SOL", updated_balances.wallet_usdc, updated_balances.wallet_sol);
+        }
+    }
+
+    // Re-fetch balances for trading (in case rebalancing changed them)
+    let final_live_balances = balance_fetcher::BalanceFetcher::fetch_all_balances().await
+        .unwrap_or(live_balances); // Fallback to original if fetch fails
+
     // 🆕 NEW: Risk check before starting
     let max_trade_value = total_capital * (config::MAX_CAPITAL_PER_TRADE_PERCENT / dec!(100.0));
     let current_trade_value = config::TRADE_AMOUNT_SOL * current_sol_price;
@@ -77,12 +101,12 @@ async fn main() -> Result<()> {
     // The application's run state
     let is_running = Arc::new(AtomicBool::new(true));
 
-    // 🔧 UPDATED: Initialize shared state with LIVE balances
+    // 🔧 UPDATED: Initialize shared state with LIVE balances (after rebalancing)
     let shared_state = Arc::new(Mutex::new(SharedState::new_with_live_balances(
-        live_balances.mexc_usdc,
-        live_balances.mexc_sol,        
-        live_balances.wallet_usdc,
-        live_balances.wallet_sol,      
+        final_live_balances.mexc_usdc,
+        final_live_balances.mexc_sol,        
+        final_live_balances.wallet_usdc,
+        final_live_balances.wallet_sol,      
         total_capital
     )));
 
@@ -98,7 +122,7 @@ async fn main() -> Result<()> {
     let engine_running = Arc::clone(&is_running);
     let failsafe_running = Arc::clone(&is_running);
 
-    log::info!("[MAIN] 🚀 Starting trading threads with live balances...");
+    log::info!("[MAIN] 🚀 Starting trading threads with rebalanced accounts...");
 
     // Task for MEXC WebSocket connector
     let mexc_sender = price_sender.clone();
@@ -148,6 +172,14 @@ async fn main() -> Result<()> {
     // Ensure all tasks shut down
     is_running.store(false, Ordering::SeqCst);
 
+    // 🆕 NEW: Shutdown rebalancing
+    log::info!("[MAIN] ⚖️ Performing shutdown rebalancing...");
+    if let Err(e) = perform_shutdown_rebalancing(current_sol_price).await {
+        log::warn!("[MAIN] ⚠️ Shutdown rebalancing failed: {}", e);
+    } else {
+        log::info!("[MAIN] ✅ Shutdown rebalancing completed!");
+    }
+
     // 🆕 NEW: Show final balance comparison
     log::info!("[MAIN] 💰 Fetching final balances for P&L calculation...");
     if let Ok(final_balances) = balance_fetcher::BalanceFetcher::fetch_all_balances().await {
@@ -159,6 +191,11 @@ async fn main() -> Result<()> {
         log::info!("[MAIN] 💰 Final Capital: ${:.4}", final_capital);
         log::info!("[MAIN] 📈 Total P&L: ${:+.4} ({:+.2}%)", 
             total_pnl, (total_pnl / total_capital * dec!(100.0)));
+        
+        // 🆕 NEW: Show final balance breakdown
+        log::info!("[MAIN] 📊 FINAL BALANCE BREAKDOWN:");
+        log::info!("[MAIN] 💰 MEXC: ${:.4} USDC + {:.6} SOL", final_balances.mexc_usdc, final_balances.mexc_sol);
+        log::info!("[MAIN] 🏦 Wallet: ${:.4} USDC + {:.6} SOL", final_balances.wallet_usdc, final_balances.wallet_sol);
     }
     
     fn log_risk_status(state: &SharedState, sol_price: Decimal) {
@@ -213,7 +250,288 @@ async fn main() -> Result<()> {
     log::info!("[MAIN] 🏁 All threads terminated. Program shutdown complete.");
     Ok(())
 }
+// ✅ ENHANCED: Add balance verification after rebalancing
+async fn verify_rebalancing_success(
+    solana_client: &SolanaTradingClient,
+    initial_balances: &balance_fetcher::LiveBalances,
+    sol_price: Decimal,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    
+    log::info!("[REBALANCE] 🔍 Verifying rebalancing results...");
+    
+    // Wait for balances to settle
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    
+    // Fetch new balances
+    let new_balances = balance_fetcher::BalanceFetcher::fetch_all_balances().await?;
+    
+    // Compare balances
+    let initial_total = initial_balances.total_capital_usd(sol_price);
+    let final_total = new_balances.total_capital_usd(sol_price);
+    let capital_change = final_total - initial_total;
+    
+    log::info!("[REBALANCE] 📊 Rebalancing Results:");
+    log::info!("[REBALANCE] 💰 Initial Capital: ${:.4}", initial_total);
+    log::info!("[REBALANCE] 💰 Final Capital: ${:.4}", final_total);
+    log::info!("[REBALANCE] 📈 Capital Change: ${:+.4} ({:+.2}%)", 
+        capital_change, (capital_change / initial_total * dec!(100.0)));
+    
+    // Check if rebalancing was successful
+    let wallet_usdc_value = new_balances.wallet_usdc;
+    let wallet_sol_value = new_balances.wallet_sol * sol_price;
+    let wallet_total = wallet_usdc_value + wallet_sol_value;
+    
+    if wallet_total > Decimal::ZERO {
+        let wallet_usdc_percent = (wallet_usdc_value / wallet_total) * dec!(100.0);
+        let wallet_sol_percent = (wallet_sol_value / wallet_total) * dec!(100.0);
+        
+        log::info!("[REBALANCE] 📊 Final Wallet Split: {:.1}% USDC / {:.1}% SOL", 
+            wallet_usdc_percent, wallet_sol_percent);
+        
+        // Check if we're now within the acceptable range
+        let target_percent = config::REBALANCE_TARGET_PERCENT;
+        let deadband = config::REBALANCE_DEADBAND_PERCENT;
+        let min_acceptable = target_percent - deadband;
+        let max_acceptable = target_percent + deadband;
+        
+        if wallet_usdc_percent >= min_acceptable && wallet_usdc_percent <= max_acceptable {
+            log::info!("[REBALANCE] ✅ Rebalancing successful - within target range");
+        } else {
+            log::warn!("[REBALANCE] ⚠️ Rebalancing incomplete - still outside target range");
+        }
+    }
+    
+    Ok(())
+}
+// 🆕 NEW: Wallet startup rebalancing
+async fn rebalance_wallet_startup(
+    solana_client: &solana_trading::SolanaTradingClient,
+    balances: &balance_fetcher::LiveBalances,
+    sol_price: Decimal
+) -> Result<()> {
+    let wallet_usdc_value = balances.wallet_usdc;
+    let wallet_sol_value = balances.wallet_sol * sol_price;
+    let wallet_total = wallet_usdc_value + wallet_sol_value;
+    
+    if wallet_total < config::REBALANCE_MIN_VALUE_USD {
+        log::info!("[STARTUP_REBALANCE] ⏭️ Wallet total ${:.2} below minimum, skipping", wallet_total);
+        return Ok(());
+    }
+    
+    let wallet_usdc_percent = (wallet_usdc_value / wallet_total) * dec!(100.0);
+    let wallet_sol_percent = (wallet_sol_value / wallet_total) * dec!(100.0);
+    
+    log::info!("[STARTUP_REBALANCE] 📊 Wallet Current: {:.1}% USDC / {:.1}% SOL", wallet_usdc_percent, wallet_sol_percent);
+    
+    if wallet_usdc_percent >= config::REBALANCE_THRESHOLD_PERCENT {
+        // Too much USDC, buy SOL
+        let target_usdc_value = wallet_total * (config::REBALANCE_TARGET_PERCENT / dec!(100.0));
+        let usdc_to_convert = wallet_usdc_value - target_usdc_value;
+        
+        if usdc_to_convert >= config::REBALANCE_MIN_TRADE_USD {
+            let usdc_lamports = (usdc_to_convert * dec!(1_000_000)).to_u64().unwrap_or(0);
+            
+            log::info!("[STARTUP_REBALANCE] 🔄 Wallet: Converting ${:.2} USDC to SOL", usdc_to_convert);
+            
+            // ✅ ENHANCED: Use confirmed swap with verification
+            match solana_client.execute_swap_with_confirmation(
+                config::USDC_MINT_ADDRESS,
+                config::SOL_MINT_ADDRESS,
+                usdc_lamports,
+                50, // ✅ REDUCED: 0.5% slippage instead of 1%
+            ).await {
+                Ok(result) => {
+                    if result.confirmed {
+                        log::info!("[STARTUP_REBALANCE] ✅ Wallet rebalancing completed in {}ms", result.confirmation_time_ms);
+                        log::info!("[STARTUP_REBALANCE] 📊 Final balances: ${:.4} USDC, {:.6} SOL", 
+                            result.final_balance_usdc.unwrap_or(Decimal::ZERO), 
+                            result.final_balance_sol.unwrap_or(Decimal::ZERO));
+                    } else {
+                        log::error!("[STARTUP_REBALANCE] ❌ Wallet rebalancing failed - transaction not confirmed");
+                        return Err(anyhow::anyhow!("Wallet rebalancing transaction not confirmed"));
+                    }
+                },
+                Err(e) => {
+                    log::error!("[STARTUP_REBALANCE] ❌ Wallet rebalancing failed: {}", e);
+                    return Err(anyhow::anyhow!("Solana USDC->SOL swap failed: {}", e));
+                }
+            }
+        }
+    } else if wallet_sol_percent >= config::REBALANCE_THRESHOLD_PERCENT {
+        // Too much SOL, sell SOL
+        let target_sol_value = wallet_total * (config::REBALANCE_TARGET_PERCENT / dec!(100.0));
+        let sol_value_to_convert = wallet_sol_value - target_sol_value;
+        
+        if sol_value_to_convert >= config::REBALANCE_MIN_TRADE_USD {
+            let sol_to_convert = sol_value_to_convert / sol_price;
+            let sol_lamports = (sol_to_convert * dec!(1_000_000_000)).to_u64().unwrap_or(0);
+            
+            log::info!("[STARTUP_REBALANCE] 🔄 Wallet: Converting {:.4} SOL to USDC", sol_to_convert);
+            
+            // ✅ ENHANCED: Use confirmed swap with verification
+            match solana_client.execute_swap_with_confirmation(
+                config::SOL_MINT_ADDRESS,
+                config::USDC_MINT_ADDRESS,
+                sol_lamports,
+                50, // ✅ REDUCED: 0.5% slippage instead of 1%
+            ).await {
+                Ok(result) => {
+                    if result.confirmed {
+                        log::info!("[STARTUP_REBALANCE] ✅ Wallet rebalancing completed in {}ms", result.confirmation_time_ms);
+                        log::info!("[STARTUP_REBALANCE] 📊 Final balances: ${:.4} USDC, {:.6} SOL", 
+                            result.final_balance_usdc.unwrap_or(Decimal::ZERO), 
+                            result.final_balance_sol.unwrap_or(Decimal::ZERO));
+                    } else {
+                        log::error!("[STARTUP_REBALANCE] ❌ Wallet rebalancing failed - transaction not confirmed");
+                        return Err(anyhow::anyhow!("Wallet rebalancing transaction not confirmed"));
+                    }
+                },
+                Err(e) => {
+                    log::error!("[STARTUP_REBALANCE] ❌ Wallet rebalancing failed: {}", e);
+                    return Err(anyhow::anyhow!("Solana SOL->USDC swap failed: {}", e));
+                }
+            }
+        }
+    } else {
+        log::info!("[STARTUP_REBALANCE] ✅ Wallet already balanced");
+    }
+    
+    Ok(())
+}
 
+// 🆕 NEW: MEXC startup rebalancing
+async fn rebalance_mexc_startup(
+    mexc_client: &mexc_trading::MexcTradingClient,
+    balances: &balance_fetcher::LiveBalances,
+    sol_price: Decimal
+) -> Result<()> {
+    let mexc_usdc_value = balances.mexc_usdc;
+    let mexc_sol_value = balances.mexc_sol * sol_price;
+    let mexc_total = mexc_usdc_value + mexc_sol_value;
+    
+    if mexc_total < config::REBALANCE_MIN_VALUE_USD {
+        log::info!("[STARTUP_REBALANCE] ⏭️ MEXC total ${:.2} below minimum, skipping", mexc_total);
+        return Ok(());
+    }
+    
+    let mexc_usdc_percent = (mexc_usdc_value / mexc_total) * dec!(100.0);
+    let mexc_sol_percent = (mexc_sol_value / mexc_total) * dec!(100.0);
+    
+    log::info!("[STARTUP_REBALANCE] 📊 MEXC Current: {:.1}% USDC / {:.1}% SOL", mexc_usdc_percent, mexc_sol_percent);
+    
+    if mexc_usdc_percent >= config::REBALANCE_THRESHOLD_PERCENT {
+        // Too much USDC, buy SOL
+        let target_usdc_value = mexc_total * (config::REBALANCE_TARGET_PERCENT / dec!(100.0));
+        let usdc_to_convert = mexc_usdc_value - target_usdc_value;
+        
+        if usdc_to_convert >= config::REBALANCE_MIN_TRADE_USD {
+            let sol_to_buy = usdc_to_convert / sol_price;
+            
+            log::info!("[STARTUP_REBALANCE] 🔄 MEXC: Converting ${:.2} USDC to {:.4} SOL", usdc_to_convert, sol_to_buy);
+            
+            mexc_client.place_order_with_current_price(
+                "SOLUSDC", "BUY", "MARKET", sol_to_buy, None
+            ).await.map_err(|e| anyhow::anyhow!("MEXC buy order failed: {}", e))?;
+            
+            log::info!("[STARTUP_REBALANCE] ✅ MEXC rebalancing completed");
+        }
+    } else if mexc_sol_percent >= config::REBALANCE_THRESHOLD_PERCENT {
+        // Too much SOL, sell SOL
+        let target_sol_value = mexc_total * (config::REBALANCE_TARGET_PERCENT / dec!(100.0));
+        let sol_value_to_convert = mexc_sol_value - target_sol_value;
+        
+        if sol_value_to_convert >= config::REBALANCE_MIN_TRADE_USD {
+            let sol_to_sell = sol_value_to_convert / sol_price;
+            
+            log::info!("[STARTUP_REBALANCE] 🔄 MEXC: Converting {:.4} SOL to ${:.2} USDC", sol_to_sell, sol_value_to_convert);
+            
+            mexc_client.place_order_with_current_price(
+                "SOLUSDC", "SELL", "MARKET", sol_to_sell, None
+            ).await.map_err(|e| anyhow::anyhow!("MEXC sell order failed: {}", e))?;
+            
+            log::info!("[STARTUP_REBALANCE] ✅ MEXC rebalancing completed");
+        }
+    } else {
+        log::info!("[STARTUP_REBALANCE] ✅ MEXC already balanced");
+    }
+    
+    Ok(())
+}
+// 🆕 NEW: Startup rebalancing function
+async fn perform_startup_rebalancing(
+    balances: &balance_fetcher::LiveBalances, 
+    sol_price: Decimal
+) -> Result<()> {
+    log::info!("[STARTUP_REBALANCE] 🔄 Analyzing account balances for optimal trading setup...");
+    
+    // Initialize trading clients
+    let app_config = config::AppConfig::new();
+    
+    let mexc_client = mexc_trading::MexcTradingClient::new(
+        app_config.mexc_api_key.clone(),
+        app_config.mexc_api_secret.clone()
+    );
+    
+    let solana_client = solana_trading::SolanaTradingClient::new(
+        app_config.solana_rpc_url.clone(),
+        app_config.solana_wallet_path.clone(),
+        app_config.jupiter_api_key.clone()
+    ).map_err(|e| anyhow::anyhow!("Failed to create Solana client: {}", e))?;
+    
+    // Check and rebalance MEXC
+    rebalance_mexc_startup(&mexc_client, balances, sol_price).await?;
+    
+    // Check and rebalance Solana wallet
+    rebalance_wallet_startup(&solana_client, balances, sol_price).await?;
+    
+    Ok(())
+}
+// 🆕 NEW: Shutdown rebalancing function
+async fn perform_shutdown_rebalancing(sol_price: Decimal) -> Result<()> {
+    log::info!("[SHUTDOWN_REBALANCE] 🔄 Rebalancing accounts for optimal storage...");
+    
+    // Fetch current balances
+    let current_balances = balance_fetcher::BalanceFetcher::fetch_all_balances().await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch balances: {}", e))?;
+    
+    // Initialize trading clients
+    let app_config = config::AppConfig::new();
+    
+    let mexc_client = mexc_trading::MexcTradingClient::new(
+        app_config.mexc_api_key.clone(),
+        app_config.mexc_api_secret.clone()
+    );
+    
+    let solana_client = solana_trading::SolanaTradingClient::new(
+        app_config.solana_rpc_url.clone(),
+        app_config.solana_wallet_path.clone(),
+        app_config.jupiter_api_key.clone()
+    ).map_err(|e| anyhow::anyhow!("Failed to create Solana client: {}", e))?;
+    
+    // Rebalance both accounts to 50/50
+    rebalance_mexc_shutdown(&mexc_client, &current_balances, sol_price).await?;
+    rebalance_wallet_shutdown(&solana_client, &current_balances, sol_price).await?;
+    
+    Ok(())
+}
+// 🆕 NEW: MEXC shutdown rebalancing (same logic as startup)
+async fn rebalance_mexc_shutdown(
+    mexc_client: &mexc_trading::MexcTradingClient,
+    balances: &balance_fetcher::LiveBalances,
+    sol_price: Decimal
+) -> Result<()> {
+    rebalance_mexc_startup(mexc_client, balances, sol_price).await
+}
+
+
+// 🆕 NEW: Wallet shutdown rebalancing (same logic as startup)
+async fn rebalance_wallet_shutdown(
+    solana_client: &solana_trading::SolanaTradingClient,
+    balances: &balance_fetcher::LiveBalances,
+    sol_price: Decimal
+) -> Result<()> {
+    rebalance_wallet_startup(solana_client, balances, sol_price).await
+}
 // ---- ENHANCED: Updated get_initial_sol_price with better headers ----
 // 🆕 NEW: Helper function to get initial SOL price with Jupiter Pro (ENHANCED)
 async fn get_initial_sol_price() -> Result<Decimal> {
@@ -341,9 +659,14 @@ mod config {
     pub const AUTO_REBALANCE_ENABLED: bool = true;
     pub const REBALANCE_THRESHOLD_PERCENT: Decimal = dec!(70.0);  // Trigger when 70% or more in one asset
     pub const REBALANCE_TARGET_PERCENT: Decimal = dec!(50.0);     // Target 50/50 split
-    pub const REBALANCE_CHECK_INTERVAL_SECONDS: u64 = 15;        // Check every 30 seconds
+    pub const REBALANCE_CHECK_INTERVAL_SECONDS: u64 = 30;        // Check every 30 seconds
     pub const REBALANCE_MIN_VALUE_USD: Decimal = dec!(100.0);    // Only rebalance if imbalance > $100  
-    pub const REBALANCE_MIN_TRADE_USD: Decimal = dec!(100.0); 
+    pub const REBALANCE_MIN_TRADE_USD: Decimal = dec!(50.0); 
+    pub const REBALANCE_CONFIRMATION_TIMEOUT_SECONDS: u64 = 30;
+
+    // ✅ ENHANCED: Better balance target ranges
+    pub const REBALANCE_DEADBAND_PERCENT: Decimal = dec!(5.0);   // ✅ NEW: 5% deadband to prevent oscillation
+    // Only rebalance if outside 45-55% range (50% ± 5%)
     
     // 🚀 NEW: Jupiter Pro Rate Limiting Configuration
     pub const JUPITER_PRO_RPM_LIMIT: u32 = 600;                    // Total Pro plan limit
@@ -570,12 +893,12 @@ mod mexc_trading {
         }
     }
 }
-// 🚀 COMPLETE SOLANA TRADING MODULE - OPTIMIZED FOR HELIUS 50 RPS
-
+// 🚀 COMPLETE ENHANCED SOLANA TRADING MODULE - WITH TRANSACTION CONFIRMATION
 mod solana_trading {
     use solana_sdk::{
         signer::{keypair::Keypair, Signer},
         commitment_config::CommitmentConfig,
+        signature::Signature,
     };
     use solana_client::rpc_client::RpcClient;
     use std::sync::Arc;
@@ -591,6 +914,16 @@ mod solana_trading {
     pub struct SwapPriceInfo {
         pub executed_price: Decimal,
         pub slippage_percent: Decimal,
+    }
+
+    // ✅ NEW: Transaction result with confirmation data
+    #[derive(Debug, Clone)]
+    pub struct TransactionResult {
+        pub signature: String,
+        pub confirmed: bool,
+        pub confirmation_time_ms: u64,
+        pub final_balance_usdc: Option<Decimal>,
+        pub final_balance_sol: Option<Decimal>,
     }
 
     #[derive(Clone)]
@@ -645,6 +978,136 @@ mod solana_trading {
 
         pub fn get_wallet_address(&self) -> String {
             self.wallet.pubkey().to_string()
+        }
+
+        // ✅ ENHANCED: Wait for transaction confirmation
+        pub async fn wait_for_confirmation(
+            &self,
+            signature: &Signature,
+            timeout_seconds: u64,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            let start = Instant::now();
+            let timeout = Duration::from_secs(timeout_seconds);
+            
+            log::info!("[SOLANA] ⏳ Waiting for transaction confirmation: {}", signature);
+            
+            while start.elapsed() < timeout {
+                // Check rate limit
+                let wait_time = self.rate_limit_check().await;
+                if wait_time > Duration::from_millis(0) {
+                    sleep(wait_time).await;
+                }
+                
+                // Update timestamp
+                self.update_rate_limit_timestamp();
+                
+                match self.client.get_signature_status(signature) {
+                    Ok(Some(status)) => {
+                        match status {
+                            Ok(_) => {
+                                log::info!("[SOLANA] ✅ Transaction confirmed in {}ms: {}", 
+                                    start.elapsed().as_millis(), signature);
+                                return Ok(true);
+                            },
+                            Err(e) => {
+                                log::error!("[SOLANA] ❌ Transaction failed: {} - Error: {:?}", signature, e);
+                                return Ok(false);
+                            }
+                        }
+                    },
+                    Ok(None) => {
+                        // Transaction not found yet, continue waiting
+                        log::debug!("[SOLANA] ⏳ Transaction not found yet, waiting... ({}ms elapsed)", 
+                            start.elapsed().as_millis());
+                    },
+                    Err(e) => {
+                        log::warn!("[SOLANA] ⚠️ Error checking transaction status: {}", e);
+                    }
+                }
+                
+                // Wait before checking again
+                sleep(Duration::from_millis(500)).await;
+            }
+            
+            log::error!("[SOLANA] ⏰ Transaction confirmation timeout after {}s: {}", timeout_seconds, signature);
+            Ok(false)
+        }
+
+        // ✅ ENHANCED: Execute swap with confirmation and balance verification
+        pub async fn execute_swap_with_confirmation(
+            &self,
+            input_mint: &str,
+            output_mint: &str,
+            amount: u64,
+            slippage_bps: u16,
+        ) -> Result<TransactionResult, Box<dyn std::error::Error + Send + Sync>> {
+            
+            let start_time = Instant::now();
+            let wallet_address = self.get_wallet_address();
+            
+            log::info!("[SOLANA] 🚀 Starting confirmed swap: {} {} to {}", amount, 
+                if input_mint.contains("So1111") { "lamports SOL" } else { "lamports USDC" },
+                if output_mint.contains("So1111") { "SOL" } else { "USDC" });
+            
+            // Get balances before swap
+            let (initial_usdc, initial_sol) = self.get_both_balances(&wallet_address).await?;
+            log::info!("[SOLANA] 📊 Initial balances: ${:.4} USDC, {:.6} SOL", initial_usdc, initial_sol);
+            
+            // Execute the swap
+            let signature_str = self.execute_swap(input_mint, output_mint, amount, slippage_bps).await?;
+            let signature = signature_str.parse::<Signature>()
+                .map_err(|e| format!("Invalid signature format: {}", e))?;
+            
+            // Wait for confirmation
+            let confirmed = self.wait_for_confirmation(&signature, 30).await?;
+            let confirmation_time = start_time.elapsed().as_millis() as u64;
+            
+            if !confirmed {
+                return Ok(TransactionResult {
+                    signature: signature_str,
+                    confirmed: false,
+                    confirmation_time_ms: confirmation_time,
+                    final_balance_usdc: None,
+                    final_balance_sol: None,
+                });
+            }
+            
+            // Wait additional time for balance updates to propagate
+            log::info!("[SOLANA] ⏳ Waiting for balance updates to propagate...");
+            sleep(Duration::from_secs(2)).await;
+            
+            // Get balances after swap
+            let (final_usdc, final_sol) = self.get_both_balances(&wallet_address).await?;
+            log::info!("[SOLANA] 📊 Final balances: ${:.4} USDC, {:.6} SOL", final_usdc, final_sol);
+            
+            // Log the actual changes
+            let usdc_change = final_usdc - initial_usdc;
+            let sol_change = final_sol - initial_sol;
+            log::info!("[SOLANA] 🔄 Balance changes: USDC {:+.4}, SOL {:+.6}", usdc_change, sol_change);
+            
+            Ok(TransactionResult {
+                signature: signature_str,
+                confirmed: true,
+                confirmation_time_ms: confirmation_time,
+                final_balance_usdc: Some(final_usdc),
+                final_balance_sol: Some(final_sol),
+            })
+        }
+
+        // ✅ NEW: Get both USDC and SOL balances efficiently
+        async fn get_both_balances(&self, wallet_address: &str) -> Result<(Decimal, Decimal), Box<dyn std::error::Error + Send + Sync>> {
+            let usdc_future = self.get_usdc_balance(wallet_address);
+            
+            // ✅ FIXED: Create pubkey first to avoid temporary value issue
+            let wallet_pubkey = wallet_address.parse::<solana_sdk::pubkey::Pubkey>()?;
+            let sol_future = self.get_sol_balance(&wallet_pubkey);
+            
+            let (usdc_result, sol_result) = tokio::join!(usdc_future, sol_future);
+            
+            let usdc_balance = usdc_result?;
+            let sol_balance = Decimal::from(sol_result?) / dec!(1_000_000_000);
+            
+            Ok((usdc_balance, sol_balance))
         }
 
         // ✅ UPGRADED: Rate limit optimized for Jupiter Pro 600 RPM
@@ -841,6 +1304,7 @@ mod solana_trading {
             Ok(Decimal::ZERO)
         }
 
+        // ✅ KEEP: Original execute_swap method for compatibility
         pub async fn execute_swap(
             &self,
             input_mint: &str,
@@ -1113,7 +1577,6 @@ mod solana_trading {
         }
     }
 }
-
 // ---- FIXED Shared State Module ----
 mod state {
     use rust_decimal::Decimal;
@@ -1461,9 +1924,9 @@ mod risk {
     use crate::{config, state::{SharedState, TradeRecord}, mexc_trading::MexcTradingClient, solana_trading::{SolanaTradingClient, SwapPriceInfo}};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use rust_decimal::prelude::*; // This provides ToPrimitive trait
     use chrono::Utc;
     use std::time::Instant;
+    use rust_decimal::prelude::*;
 
     pub struct RiskManager;
 
@@ -2652,7 +3115,6 @@ mod auto_rebalancer {
         
         match solana_client {
             Some(solana) => {
-                // ✅ FIXED: Better rebalancing logic with deadband
                 if wallet_usdc_percent >= config::REBALANCE_THRESHOLD_PERCENT {
                     // Too much USDC, buy SOL
                     let target_usdc_value = wallet_total * (config::REBALANCE_TARGET_PERCENT / dec!(100.0));
@@ -2664,15 +3126,27 @@ mod auto_rebalancer {
                         log::info!("[REBALANCE] 🔄 Wallet: Too much USDC ({:.1}%), swapping ${:.2} to SOL", 
                             wallet_usdc_percent, usdc_to_convert);
                         
-                        if let Err(e) = solana.execute_swap(
+                        // ✅ ENHANCED: Use confirmed swap with verification
+                        match solana.execute_swap_with_confirmation(
                             config::USDC_MINT_ADDRESS,
                             config::SOL_MINT_ADDRESS,
                             usdc_lamports,
-                            100, // 1% slippage for rebalancing
+                            50, // ✅ REDUCED: 0.5% slippage
                         ).await {
-                            log::error!("[REBALANCE] ❌ Wallet USDC->SOL swap failed: {}", e);
-                        } else {
-                            log::info!("[REBALANCE] ✅ Wallet rebalance completed: Swapped ${:.2} USDC to SOL", usdc_to_convert);
+                            Ok(result) => {
+                                if result.confirmed {
+                                    log::info!("[REBALANCE] ✅ Wallet rebalance completed in {}ms: Swapped ${:.2} USDC to SOL", 
+                                        result.confirmation_time_ms, usdc_to_convert);
+                                    log::info!("[REBALANCE] 📊 New balances: ${:.4} USDC, {:.6} SOL", 
+                                        result.final_balance_usdc.unwrap_or(Decimal::ZERO), 
+                                        result.final_balance_sol.unwrap_or(Decimal::ZERO));
+                                } else {
+                                    log::error!("[REBALANCE] ❌ Wallet USDC->SOL swap failed - transaction not confirmed");
+                                }
+                            },
+                            Err(e) => {
+                                log::error!("[REBALANCE] ❌ Wallet USDC->SOL swap failed: {}", e);
+                            }
                         }
                     } else {
                         log::debug!("[REBALANCE] ⏭️ Wallet trade too small: ${:.2} < ${:.2}", usdc_to_convert, config::REBALANCE_MIN_TRADE_USD);
@@ -2689,15 +3163,27 @@ mod auto_rebalancer {
                         log::info!("[REBALANCE] 🔄 Wallet: Too much SOL ({:.1}%), swapping {:.4} SOL to USDC", 
                             wallet_sol_percent, sol_to_convert);
                         
-                        if let Err(e) = solana.execute_swap(
+                        // ✅ ENHANCED: Use confirmed swap with verification
+                        match solana.execute_swap_with_confirmation(
                             config::SOL_MINT_ADDRESS,
                             config::USDC_MINT_ADDRESS,
                             sol_lamports,
-                            100, // 1% slippage for rebalancing
+                            50, // ✅ REDUCED: 0.5% slippage
                         ).await {
-                            log::error!("[REBALANCE] ❌ Wallet SOL->USDC swap failed: {}", e);
-                        } else {
-                            log::info!("[REBALANCE] ✅ Wallet rebalance completed: Swapped {:.4} SOL to USDC", sol_to_convert);
+                            Ok(result) => {
+                                if result.confirmed {
+                                    log::info!("[REBALANCE] ✅ Wallet rebalance completed in {}ms: Swapped {:.4} SOL to USDC", 
+                                        result.confirmation_time_ms, sol_to_convert);
+                                    log::info!("[REBALANCE] 📊 New balances: ${:.4} USDC, {:.6} SOL", 
+                                        result.final_balance_usdc.unwrap_or(Decimal::ZERO), 
+                                        result.final_balance_sol.unwrap_or(Decimal::ZERO));
+                                } else {
+                                    log::error!("[REBALANCE] ❌ Wallet SOL->USDC swap failed - transaction not confirmed");
+                                }
+                            },
+                            Err(e) => {
+                                log::error!("[REBALANCE] ❌ Wallet SOL->USDC swap failed: {}", e);
+                            }
                         }
                     } else {
                         log::debug!("[REBALANCE] ⏭️ Wallet trade too small: ${:.2} < ${:.2}", sol_value_to_convert, config::REBALANCE_MIN_TRADE_USD);
